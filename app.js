@@ -40,9 +40,9 @@ function freshState(SEED) {
 }
 function load() {
   try { const raw = LS.getItem(KEY); if (raw) S = JSON.parse(raw); } catch (e) { console.warn(e); }
-  if (S) PROGRAM = S.programDays || [];
+  if (S) { PROGRAM = S.programDays || []; migrateMovements(); }
 }
-function adopt(st) { S = st; PROGRAM = S.programDays || []; invalidate(); }
+function adopt(st) { S = st; PROGRAM = S.programDays || []; migrateMovements(); invalidate(); }
 let saveTimer = null;
 function persist(sync = true) {
   S.updated = new Date().toISOString();
@@ -170,6 +170,7 @@ function pausedDays(from, to) {
 }
 function eventCandidates(ev) {
   const c = S.tests.filter(t => t.event === ev.k).map(t => ({ value: t.value, date: t.date, bw: t.bw || bwAt(t.date), src: 'test', note: t.note }));
+  for (const t of testBlocks()) if (t.event === ev.k) c.push({ value: t.value, date: t.date, bw: t.bw, src: 'test', wid: t.wid });
   if (ev.feed) for (const s of sessions(ev.feed)) if (s.e1 != null) c.push({ value: s.e1, date: s.date, bw: s.bw, src: 'lift', wid: s.wid });
   return c;
 }
@@ -204,7 +205,7 @@ const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
 const progDay = id => PROGRAM.find(d => d.id === id);
 function nextProgramDay() { return PROGRAM.find(d => !S.program.completed[d.id]) || null; }
 const activeWorkout = () => S.workouts.find(w => w.status === 'active');
-function sigOf(b) { return (b.title + '|' + (b.movements || []).join('|')).toLowerCase().replace(/[^a-z0-9|]+/g, ''); }
+function sigOf(b) { return (b.title + '|' + (b.movements || []).map(mvText).join('|')).toLowerCase().replace(/[^a-z0-9|]+/g, ''); }
 function dayLabel(d) { return `Week ${d.week} · Day ${d.day}`; }
 function daySummary(d) {
   if (d.kind === 'ruck') return d.ruck.text;
@@ -227,7 +228,7 @@ function workoutFromProgram(d) {
     }
     d.stamina.forEach((p, i) => {
       const lbl = d.stamina.length > 1 ? `Part ${'ABC'[i]} · ` : '';
-      blocks.push({ type: 'cond', title: p.title, label: lbl, format: p.format, cap: p.cap || '', movements: [...p.movements], restAfter: p.restAfter || '', result: {}, sig: sigOf(p) });
+      blocks.push(condFromProgram(p, lbl));
     });
   }
   return { id: uid(), date: today(), name: '', programDay: d.id, cycle: S.program.cycle, status: 'active', blocks, notes: '' };
@@ -235,7 +236,7 @@ function workoutFromProgram(d) {
 function workoutTitle(w) {
   if (w.name) return w.name;
   if (w.programDay) { const d = progDay(w.programDay); return `W${d.week} D${d.day} · ${d.kind === 'ruck' ? 'Ruck' : CORE_LABEL[d.strength.lift]}`; }
-  const ex = [...new Set((w.blocks || []).map(b => b.type === 'strength' ? b.exercise : b.type === 'cond' ? (b.title || 'Conditioning') : b.type === 'ruck' ? 'Ruck' : b.type === 'cardio' ? (b.mode || 'Cardio') : null).filter(Boolean))];
+  const ex = [...new Set((w.blocks || []).map(b => b.type === 'strength' ? b.exercise : b.type === 'cond' ? (b.title || 'Conditioning') : b.type === 'ruck' ? 'Ruck' : b.type === 'cardio' ? (b.mode || 'Cardio') : b.type === 'test' ? ((EVENTS.find(e => e.k === b.event) || {}).short || 'Test') : null).filter(Boolean))];
   return ex.slice(0, 3).join(', ') + (ex.length > 3 ? '…' : '') || 'Workout';
 }
 function condResultStr(b) {
@@ -406,6 +407,7 @@ function route() {
   $('#app').innerHTML = (PREVIEW ? `<div class="card small" style="border-color:#6b5317;background:#2a2210"><b>Preview copy.</b> <span class="sec">This is your real data, so try anything. Nothing here touches your real app or backup, and changes may not stick.</span></div>` : '') + fn(arg);
   attachCharts();
   if (views[name + '_after']) views[name + '_after'](arg);
+  if (typeof keepAwake === 'function') { const w = name === 'workout' ? S.workouts.find(x => x.id === arg) : null; keepAwake(!!(w && w.status === 'active') || !!T); }
 }
 window.addEventListener('hashchange', () => { if (!S) return welcome(); window.scrollTo(0, 0); route(); });
 function rerender() { const y = window.scrollY; route(); window.scrollTo(0, y); }
@@ -499,13 +501,16 @@ views.workout_after = id => {
     const bi = t.dataset.b; if (bi === undefined) return;
     const b = w.blocks[+bi]; const f = t.dataset.f;
     if (t.dataset.s !== undefined) { const s = b.sets[+t.dataset.s]; s[f] = f === 'w' || f === 'r' ? (t.value === '' ? '' : +t.value) : t.value; invalidate(); save(); return; }
+    if (t.dataset.m !== undefined) { const m = b.movements[+t.dataset.m]; m[f] = f === 'wt' ? (t.value === '' ? '' : +t.value) : t.value; b.sig = sigOf(b); save(); return; }
+    if (f === 'testval') { const ev = EVENTS.find(e => e.k === b.event); b.value = t.value === '' ? '' : ev.time ? strToSec(t.value) : num(t.value); const sc = document.querySelector(`[data-score="${bi}"]`); if (sc) { const v = b.value; sc.textContent = v === '' || v == null ? '–' : Math.round(ev.score(v, workoutBW(w), S.settings.heightIn || 71)) + '%'; } invalidate(); save(); return; }
+    if (f === 'every') { b.every = strToSec(t.value); save(); return; }
     if (f === 'movements') b.movements = t.value.split('\n');
     else if (f.startsWith('res.')) { b.result = b.result || {}; const k = f.slice(4); b.result[k] = k === 'time' ? strToSec(t.value) : t.value; }
     else b[f] = t.value;
-    if (b.type === 'cond' && (f === 'title' || f === 'movements')) b.sig = sigOf({ title: b.title, movements: b.movements.filter(Boolean) });
+    if (b.type === 'cond' && f === 'title') b.sig = sigOf(b);
     save();
   };
-  app.onchange = e => { const t = e.target; if (t.dataset.f === 'format' || t.dataset.f === 'exercise') { invalidate(); saveNow(); rerender(); } };
+  app.onchange = e => { const t = e.target; if (['format', 'exercise', 'kind', 'unit', 'rounds', 'cap', 'every', 'count'].includes(t.dataset.f) || (t.dataset.m !== undefined && t.dataset.f === 'amt')) { invalidate(); saveNow(); rerender(); } };
 };
 function blockHTML(w, b, i) {
   const del = `<button class="x" onclick="blockMenu('${w.id}',${i})" aria-label="Block options">⋯</button>`;
@@ -522,14 +527,16 @@ function blockHTML(w, b, i) {
       <div><label class="f">Distance (mi)</label><input inputmode="decimal" data-b="${i}" data-f="distance" value="${esc(b.distance)}"></div><div><label class="f">Moving time</label><input data-b="${i}" data-f="res.time" value="${esc(secToStr(b.result && b.result.time))}" placeholder="h:mm:ss"></div></div>
       <label class="f">Notes</label><input data-b="${i}" data-f="notes" value="${esc(b.notes || '')}" placeholder="Terrain, pace, feet…"></div>`;
   }
-  if (b.type === 'cardio') return `<div class="card"><div class="blockhead"><span class="kind grow">Cardio</span>${del}</div><div class="grid2"><div><label class="f">Type</label><input data-b="${i}" data-f="mode" value="${esc(b.mode || '')}" placeholder="Run, Row, Bike…" list="cardiolist"></div><div><label class="f">Distance</label><input data-b="${i}" data-f="distance" value="${esc(b.distance || '')}" placeholder="e.g. 2 mi, 5000 m"></div><div><label class="f">Time (mm:ss)</label><input data-b="${i}" data-f="res.time" value="${esc(secToStr(b.result && b.result.time))}"></div><div><label class="f">Calories</label><input inputmode="decimal" data-b="${i}" data-f="cals" value="${esc(b.cals || '')}"></div></div><datalist id="cardiolist"><option>Run</option><option>Row</option><option>Assault Bike</option><option>Ski Erg</option><option>Swim</option><option>Walk</option></datalist></div>`;
+  if (b.type === 'test') return testHTML(w, b, i, del);
+  if (b.type === 'cardio') return cardioHTML(w, b, i, del);
+  if (b.type === 'cardio_old') return `<div class="card"><div class="blockhead"><span class="kind grow">Cardio</span>${del}</div><div class="grid2"><div><label class="f">Type</label><input data-b="${i}" data-f="mode" value="${esc(b.mode || '')}" placeholder="Run, Row, Bike…" list="cardiolist"></div><div><label class="f">Distance</label><input data-b="${i}" data-f="distance" value="${esc(b.distance || '')}" placeholder="e.g. 2 mi, 5000 m"></div><div><label class="f">Time (mm:ss)</label><input data-b="${i}" data-f="res.time" value="${esc(secToStr(b.result && b.result.time))}"></div><div><label class="f">Calories</label><input inputmode="decimal" data-b="${i}" data-f="cals" value="${esc(b.cals || '')}"></div></div><datalist id="cardiolist"><option>Run</option><option>Row</option><option>Assault Bike</option><option>Ski Erg</option><option>Swim</option><option>Walk</option></datalist></div>`;
   if (b.type === 'note') return `<div class="card"><div class="blockhead"><span class="kind grow">Note</span>${del}</div><textarea data-b="${i}" data-f="text">${esc(b.text || '')}</textarea></div>`;
   return '';
 }
 function strengthHTML(w, b, i, del) {
   const ex = b.exercise || '', rx = b.rx, pull = ex === 'Pull-Up', bw = workoutBW(w);
   let h = `<div class="card"><div class="blockhead"><span class="kind">Strength</span><span class="grow"></span>${del}</div>`;
-  h += `<input data-b="${i}" data-f="exercise" value="${esc(ex)}" list="exlist" placeholder="Exercise" style="font-weight:600">`;
+  h += `<button class="mvname btn-block" onclick="pickExercise('${w.id}',${i})">${esc(ex || 'Choose exercise')}</button>`;
   if (rx) {
     if (rx.test) h += `<p class="small sec" style="margin-top:8px">Build to a 2-rep max in ${rx.cap} minutes. Log every set; your heaviest 2-rep set becomes your new 2RM.</p>`;
     else { const tr = targetRange(rx); h += `<p class="small sec" style="margin-top:8px">${rx.sets} sets × ${rx.reps[0]}${rx.reps[1] !== rx.reps[0] ? '–' + rx.reps[1] : ''} reps @ ${rx.pct[0]}${rx.pct[1] !== rx.pct[0] ? '–' + rx.pct[1] : ''}% → <b>${tr ? wLabel(ex, tr[0]) + (tr[1] !== tr[0] ? '–' + wLabel(ex, tr[1]) : '') + ' lb' : 'set your 2RM'}</b>${rx.rest ? ' · ' + esc(rx.rest.toLowerCase()) : ''}</p>`; }
@@ -542,7 +549,7 @@ function strengthHTML(w, b, i, del) {
     h += `<tr><td class="muted small">${s.wu ? 'W' : j + 1}</td><td><input inputmode="decimal" data-b="${i}" data-s="${j}" data-f="w" value="${s.w === '' ? '' : s.w}" placeholder="${pull ? '0' : ''}"></td><td><input inputmode="numeric" data-b="${i}" data-s="${j}" data-f="r" value="${s.r === '' ? '' : s.r}"></td><td class="small muted">${v ? (pull ? '+' : '') + Math.round(v) : ''}</td><td><button class="chk ${s.done ? 'on' : ''}" onclick="toggleSet('${w.id}',${i},${j})" aria-label="Done">✓</button></td><td><button class="x" onclick="delSet('${w.id}',${i},${j})" aria-label="Remove set">×</button></td></tr>`;
   });
   h += `</table><div class="row" style="margin-top:6px"><button class="btn-sm grow" onclick="addSet('${w.id}',${i})">＋ Set</button><button class="btn-sm" onclick="addSet('${w.id}',${i},true)">＋ Warm-up set</button></div>`;
-  h += exDatalist() + `</div>`;
+  h += `</div>`;
   return h;
 }
 function lastSessionBefore(ex, w) { const ss = sessions(ex).filter(s => s.wid !== w.id && s.date <= w.date); return ss.length ? ss[ss.length - 1] : null; }
@@ -552,24 +559,7 @@ function exDatalist() {
   return _exl;
 }
 const FORMATS = { amrap: 'AMRAP', fortime: 'For Time', emom: 'EMOM', interval: 'Every X min / Intervals', rounds: 'Rounds', other: 'Other' };
-function condHTML(w, b, i, del) {
-  const r = b.result || {};
-  let h = `<div class="card"><div class="blockhead"><span class="kind grow">${esc(b.label || '')}Conditioning</span>${del}</div>`;
-  h += `<input data-b="${i}" data-f="title" value="${esc(b.title)}" placeholder="Title, e.g. 20 Minutes – AMRAP" style="font-weight:600">`;
-  h += `<div class="grid2"><div><label class="f">Format</label><select data-b="${i}" data-f="format">${Object.entries(FORMATS).map(([k, l]) => `<option value="${k}" ${b.format === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div><div><label class="f">Time cap (min)</label><input inputmode="decimal" data-b="${i}" data-f="cap" value="${esc(b.cap || '')}"></div></div>`;
-  h += `<label class="f">Movements (one per line)</label><textarea data-b="${i}" data-f="movements" placeholder="One movement per line, e.g. 20 Push-Up">${esc((b.movements || []).join('\n'))}</textarea>`;
-  h += `<label class="f">Result</label><div class="grid2">`;
-  if (b.format === 'amrap') h += `<div><input inputmode="numeric" data-b="${i}" data-f="res.rounds" value="${esc(r.rounds ?? '')}" placeholder="Rounds"></div><div><input inputmode="numeric" data-b="${i}" data-f="res.reps" value="${esc(r.reps ?? '')}" placeholder="+ Reps"></div>`;
-  else h += `<div><input data-b="${i}" data-f="res.time" value="${esc(secToStr(r.time))}" placeholder="Time mm:ss"></div>`;
-  h += `<div style="${b.format === 'amrap' ? 'grid-column:1/-1' : ''}"><input data-b="${i}" data-f="res.score" value="${esc(r.score || '')}" placeholder="${b.format === 'amrap' ? 'Other score (optional)' : 'Score: cals, meters, rounds…'}"></div></div>`;
-  h += `<input data-b="${i}" data-f="res.notes" value="${esc(r.notes || '')}" placeholder="Weights used / subs" style="margin-top:8px">`;
-  if (b.restAfter) h += `<p class="small muted" style="margin-top:8px">Then: ${esc(b.restAfter)}</p>`;
-  const prev = b.sig ? condHistory(b.sig, w.id) : [];
-  if (prev.length) h += `<p class="small muted" style="margin-top:8px">Previous: ${prev.slice(0, 3).map(p => `<a href="#workout-${p.wid}">${fmtDate(p.date, false)}: ${esc(p.res)}</a>`).join(' · ')}</p>`;
-  return h + `</div>`;
-}
 window.toggleWarm = (wid, i, j, v) => { getW(wid).blocks[i].items[j].done = v; saveNow(); rerender(); };
-window.toggleSet = (wid, i, j) => { const s = getW(wid).blocks[i].sets[j]; s.done = !s.done; invalidate(); saveNow(); rerender(); };
 window.addSet = (wid, i, wu) => { const b = getW(wid).blocks[i]; const l = b.sets[b.sets.length - 1] || { w: '', r: '' }; b.sets.push({ w: l.w, r: l.r, done: false, ...(wu ? { wu: true } : {}) }); saveNow(); rerender(); };
 window.delSet = (wid, i, j) => { getW(wid).blocks[i].sets.splice(j, 1); invalidate(); saveNow(); rerender(); };
 window.blockMenu = async (wid, i) => {
@@ -585,26 +575,8 @@ window.blockMenu = async (wid, i) => {
   if (lbl === 'Remove' && await okay('Remove this from the workout?', 'Remove')) w.blocks.splice(i, 1);
   invalidate(); saveNow(); rerender();
 };
-window.addBlock = async wid => {
-  const w = getW(wid);
-  const opts = [{ label: '🏋️ Strength exercise (sets × reps)' }, { label: '⏱️ AMRAP' }, { label: '🏁 For Time' }, { label: '🔁 EMOM / Every X minutes' }, { label: '🔂 Rounds' }, { label: '🎒 Ruck' }, { label: '🏃 Cardio (run, row, bike…)' }, { label: '📝 Note' }];
-  if (S.templates.length) opts.push({ label: '⭐ Saved pieces…' });
-  const k = await sheet('Add to workout', opts); if (k < 0) return;
-  let b;
-  if (k === 0) { const ex = await ask('Exercise name', '', { ph: 'e.g. Front Squat, Bench Press', ok: 'Add' }); if (!ex) return; b = { type: 'strength', exercise: ex.trim(), sets: [{ w: '', r: '', done: false }] }; }
-  else if (k >= 1 && k <= 4) { const f = ['amrap', 'fortime', 'emom', 'rounds'][k - 1]; b = { type: 'cond', title: { amrap: '20 Minutes – AMRAP', fortime: 'For Time', emom: 'EMOM', rounds: '4 Rounds' }[f], format: f, cap: f === 'amrap' ? 20 : '', movements: [], result: {}, sig: '' }; }
-  else if (k === 5) b = { type: 'ruck', weight: '', minutes: '', distance: '', notes: '', result: {} };
-  else if (k === 6) b = { type: 'cardio', mode: '', distance: '', cals: '', result: {} };
-  else if (k === 7) b = { type: 'note', text: '' };
-  else {
-    const t = await sheet('Saved pieces', S.templates.map(t => ({ label: esc(t.name) }))); if (t < 0) return;
-    b = JSON.parse(JSON.stringify(S.templates[t].block)); b.result = {}; if (b.sets) b.sets.forEach(s => s.done = false);
-  }
-  w.blocks.push(b); invalidate(); saveNow(); rerender();
-  setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 30);
-};
 window.finishWorkout = wid => {
-  const w = getW(wid);
+  const w = getW(wid); stopRest(); keepAwake(false);
   // drop empty sets
   w.blocks.forEach(b => { if (b.type === 'strength') { b.sets = b.sets.filter(s => s.r !== '' && s.r > 0); b.sets.forEach(s => s.done = true); } });
   w.blocks = w.blocks.filter(b => b.type !== 'strength' || b.sets.length);
@@ -655,7 +627,7 @@ views.history = () => {
     const m = w.date.slice(0, 7);
     if (m !== month) { month = m; h += `<div class="small muted" style="padding:12px 0 2px;text-transform:uppercase;letter-spacing:.05em">${MON[+m.slice(5) - 1]} ${m.slice(0, 4)}</div>`; }
     const top = w.blocks.filter(b => b.type === 'strength').map(b => { const ss = b.sets.filter(s => !s.wu && s.r > 0); if (!ss.length) return ''; const t = ss.reduce((a, s) => (+s.w || 0) > (+a.w || 0) ? s : a, ss[0]); return `${b.exercise} ${wLabel(b.exercise, +t.w || 0)}×${t.r}`; }).filter(Boolean);
-    const cond = w.blocks.filter(b => b.type === 'cond' && condResultStr(b)).map(b => condResultStr(b));
+    const cond = w.blocks.filter(b => b.type === 'cond' && condResultStr(b)).map(b => condResultStr(b)).concat(w.blocks.filter(b => b.type === 'test' && b.value !== '' && b.value != null).map(b => { const ev = EVENTS.find(e => e.k === b.event); return ev ? `${ev.short} ${fmtEv(ev, b.value)}` : ''; }));
     h += `<div class="item" onclick="location.hash='#workout-${w.id}'"><div style="width:44px;text-align:center"><div style="font-size:18px;font-weight:700">${+w.date.slice(8)}</div><div class="small muted">${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date(dnum(w.date) * 864e5).getUTCDay()]}</div></div><div class="grow"><div style="font-weight:600">${esc(workoutTitle(w))}${w.status === 'active' ? ' <span class="tag">in progress</span>' : ''}${w.prs && w.prs.length ? ' <span class="tag pr">PR</span>' : ''}</div><div class="small muted" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(top.concat(cond).join(' · ') || '—')}</div></div><span class="muted">›</span></div>`;
   }
   h += `</div>`;
@@ -743,8 +715,8 @@ views.event = k => {
     h += `<h2>Standards ladder</h2><p class="small muted">At ${bwN} lb${ev.k === 'longjump' ? ` and ${hN}"` : ''}. ${ev.lower ? 'Lower is better.' : 'Higher is better.'}</p><table class="tbl"><tr><th>Score</th><th class="n">${ev.lower ? 'Need at most' : 'Need'}</th><th></th></tr>`;
     for (let p = 100; p >= 0; p -= 10) { const mark = me >= p && me < p + 10 ? '◀ now' : raw >= p && raw < p + 10 && raw !== me ? '◀ before decay' : ''; h += `<tr${mark === '◀ now' ? ' style="background:var(--surface-2)"' : ''}><td>${p}%</td><td class="n"><b>${fmtStd(ev, valAt(ev, p, bwN, hN))}</b></td><td class="small" style="color:var(--series-1)">${mark}</td></tr>`; }
     h += `</table>`; }
-  const tests = S.tests.filter(t => t.event === k).sort((a, b) => a.date < b.date ? 1 : -1);
-  h += `<h2>Test results</h2>${tests.length ? `<table class="tbl"><tr><th>Date</th><th class="n">Result</th><th class="n">Score</th><th></th></tr>${tests.map(t => `<tr><td>${fmtDate(t.date)}<div class="small muted">${esc(t.note || '')}</div></td><td class="n">${fmtEv(ev, t.value)}</td><td class="n">${fmtNum(ev.score(t.value, t.bw || bwAt(t.date), S.settings.heightIn), 0)}</td><td class="n"><button class="x" onclick="delTest('${t.id}','${k}')">×</button></td></tr>`).join('')}</table>` : '<p class="muted">None yet.</p>'}`;
+  const tests = S.tests.filter(t => t.event === k).concat(testBlocks().filter(t => t.event === k).map(t => ({ ...t, id: null, note: 'Logged in a workout' }))).sort((a, b) => a.date < b.date ? 1 : -1);
+  h += `<h2>Test results</h2>${tests.length ? `<table class="tbl"><tr><th>Date</th><th class="n">Result</th><th class="n">Score</th><th></th></tr>${tests.map(t => `<tr><td>${fmtDate(t.date)}<div class="small muted">${esc(t.note || '')}</div></td><td class="n">${fmtEv(ev, t.value)}</td><td class="n">${fmtNum(ev.score(t.value, t.bw || bwAt(t.date), S.settings.heightIn), 0)}</td><td class="n">${t.id ? `<button class="x" onclick="delTest('${t.id}','${k}')">×</button>` : `<a href="#workout-${t.wid}">›</a>`}</td></tr>`).join('')}</table>` : '<p class="muted">None yet.</p>'}`;
   if (ev.feed) h += `<p class="small muted">This event also updates from your ${esc(ev.feed)} training sets.</p>`;
   return h;
 };
@@ -824,6 +796,454 @@ window.importJSON = inp => {
   const f = inp.files[0]; if (!f) return; const r = new FileReader();
   r.onload = async () => { try { const st = JSON.parse(r.result); if (!st.workouts) throw new Error('not a Training Log file'); if (!(await okay(`Replace this phone's data with this file? (${st.workouts.length} workouts)`, 'Replace'))) return; const keep = { syncUrl: S.settings.syncUrl, syncKey: S.settings.syncKey }; adopt(st); Object.assign(S.settings, keep); saveNow(); toast('✅ Imported'); location.hash = '#today'; route(); } catch (e) { toast('⚠️ ' + esc(e.message)); } };
   r.readAsText(f);
+};
+
+
+/* =====================================================================
+   Pick lists, structured movements, test events, paces, timers
+   ===================================================================== */
+
+/* ---------- lists ---------- */
+const BASE_CARDIO = ['Run', 'Row', 'Assault Bike', 'Ski Erg', 'Bike', 'Swim', 'Walk', 'Ruck', 'Jump Rope', 'Stair Climber', 'Sled Push'];
+const BASE_EXERCISES = ['Back Squat', 'Front Squat', 'Deadlift', 'Romanian Deadlift', 'Strict Press', 'Push Press', 'Bench Press', 'Incline Bench Press', 'Pull-Up', 'Chin Ups', 'Barbell Row', 'Power Clean', 'Hang Power Clean', 'Clean', 'Clean and Jerk', 'Snatch', 'Hip Thrust', 'Dip', 'Lunge', 'Bulgarian Split Squat', 'Dumbbell Bench Press', 'Dumbbell Shoulder Press', 'Lat Pulldown', 'Good Morning', 'Barbell Shrug', 'Dumbbell Curl'];
+const BASE_MOVES = ['Air Squat', 'Push-Up', 'Hand Release Push-Up', 'Pull-Up', 'Burpee', 'Sit-Up', 'Toes to Bar', 'Box Jump', 'Wall Ball', 'Kettlebell Swing', 'Thruster', 'Lunge', 'Walking Lunge', 'Double Under', 'Jump Rope', 'Plank', 'Farmer\'s Carry', 'Sandbag Carry', 'Run', 'Row', 'Assault Bike', 'Ski Erg', 'Rest'];
+function ensureCustom() { S.custom = S.custom || { exercise: [], cardio: [], movement: [] }; return S.custom; }
+function listFor(kind) {
+  const c = ensureCustom(); const set = new Set();
+  if (kind === 'exercise') { BASE_EXERCISES.concat(c.exercise).forEach(x => set.add(x)); S.workouts.forEach(w => (w.blocks || []).forEach(b => b.type === 'strength' && b.exercise && set.add(b.exercise))); }
+  if (kind === 'cardio') { BASE_CARDIO.concat(c.cardio).forEach(x => set.add(x)); S.workouts.forEach(w => (w.blocks || []).forEach(b => b.type === 'cardio' && b.mode && set.add(b.mode))); }
+  if (kind === 'movement') {
+    BASE_MOVES.concat(c.movement).forEach(x => set.add(x));
+    for (const d of PROGRAM) for (const p of d.stamina || []) for (const t of p.movements.concat([p.title])) { const m = parseMv(t); if (m.kind !== 'note' && m.kind !== 'rest' && m.name && m.name.length < 60) set.add(m.name); }
+    S.workouts.forEach(w => (w.blocks || []).forEach(b => b.type === 'cond' && (b.movements || []).forEach(m => m && m.name && m.kind !== 'note' && m.kind !== 'rest' && set.add(m.name))));
+  }
+  return [...set].sort((a, b) => a.localeCompare(b));
+}
+function pick(title, kind, current = '') {
+  return new Promise(res => {
+    const el = document.createElement('div'); el.className = 'sheet';
+    el.innerHTML = `<div class="panel picker"><h3>${esc(title)}</h3><input class="pq" placeholder="Search or type a new one" value="" autocapitalize="words" autocorrect="off"><div class="plist"></div><button class="btn-ghost pcancel" style="text-align:center">Cancel</button></div>`;
+    const all = listFor(kind), q = el.querySelector('.pq'), list = el.querySelector('.plist');
+    const draw = () => {
+      const v = q.value.trim(), lv = v.toLowerCase();
+      const hits = all.filter(x => x.toLowerCase().includes(lv));
+      const exact = all.some(x => x.toLowerCase() === lv);
+      list.innerHTML = (v && !exact ? `<button class="padd" data-new="1">＋ Add “${esc(v)}”</button>` : '') + hits.map(x => `<button class="pitem ${x === current ? 'on' : ''}" data-v="${esc(x)}">${esc(x)}</button>`).join('') || '<p class="muted small">Nothing yet. Type a name above.</p>';
+    };
+    const done = v => { el.remove(); res(v); };
+    el.addEventListener('click', e => {
+      const b = e.target.closest('button');
+      if (e.target === el || (b && b.classList.contains('pcancel'))) return done(null);
+      if (!b) return;
+      if (b.dataset.new) { const v = q.value.trim(); const c = ensureCustom(); if (!c[kind].includes(v)) c[kind].push(v); saveNow(); return done(v); }
+      if (b.dataset.v) done(b.dataset.v);
+    });
+    q.addEventListener('input', draw);
+    q.addEventListener('keydown', e => { if (e.key === 'Enter') { const f = list.querySelector('button'); if (f) f.click(); } });
+    document.body.appendChild(el); draw(); setTimeout(() => q.focus(), 60);
+  });
+}
+
+/* ---------- movement parsing (program text → structured) ---------- */
+const UNIT_LABEL = { reps: 'reps', cal: 'cal', m: 'm', ft: 'ft', mi: 'mi', time: 'time', rest: 'rest' };
+function parseDur(t) {
+  const m = String(t).match(/(\d+(?::\d+)?)\s*(second|sec|s\b|minute|min)/i);
+  if (!m) return null;
+  const v = m[1].includes(':') ? strToSec(m[1]) : +m[1];
+  return /^s/i.test(m[2]) ? v : (m[1].includes(':') ? v : v * 60);
+}
+function parseMv(raw) {
+  let t = String(raw || '').replace(/\s+/g, ' ').trim();
+  const out = { name: '', kind: 'reps', amt: '', wt: '', note: '' };
+  if (!t) return out;
+  const sm = t.match(/^Minute (\d+):\s*(.*)$/i); if (sm) { out.slot = +sm[1]; t = sm[2]; }
+  if (/^(Then|With Remaining Time.*|\d+ Rounds?)$/i.test(t)) return { name: t, kind: 'note', amt: '', wt: '', note: '' };
+  const rest = t.match(/^(?:Walk\/)?Rest\b\s*(.*)$/i);
+  if (rest) { const d = parseDur(rest[1]); return { name: 'Rest', kind: 'rest', amt: d ? secToStr(d) : '', wt: '', note: /after each round/i.test(t) ? 'after each round' : (/walk/i.test(t) ? 'walk/rest' : '') }; }
+  const notes = [];
+  t = t.replace(/\(([^)]*)\)/g, (_, x) => { notes.push(x.trim()); return ''; }).replace(/\s+/g, ' ').trim();
+  let [main, ...atParts] = t.split(/\s@\s|\s@(?=\d)/); main = (main || '').trim(); let at = atParts.join(' @ ').trim();
+  // @ part
+  if (at) {
+    at = at.replace(/(\d+(?:\.\d+)?)\/\d+(?:\.\d+)?\s*(lbs?|ins?|ft)\b/gi, (_, a, u) => {
+      if (/^lb/i.test(u)) { out.wt = +a; return ''; }
+      notes.push(`${a} ${/^in/i.test(u) ? 'in' : u}`); return '';
+    });
+    at = at.replace(/^(\d+(?:\.\d+)?)\s*lbs?\b/i, (_, a) => { out.wt = +a; return ''; });
+    const pace = at.match(/(\d)K\s*pace from Week 1/i); if (pace) { out.pace = pace[1] + 'k'; at = at.replace(pace[0], ''); }
+    const bwp = at.match(/(\d+)% of Bodyweight/i); if (bwp) { out.wtPct = +bwp[1]; at = at.replace(bwp[0], ''); }
+    const cal = at.match(/^(\d+)\s*Calories?$/i); if (cal) { out.kind = 'cal'; out.amt = cal[1]; at = ''; }
+    at = at.replace(/^[,\s]+|[,\s]+$/g, '');
+    if (at) notes.unshift(at);
+  }
+  let mm;
+  if ((mm = main.match(/^(\d+(?::\d+)?)\s*(second|seconds|minute|minutes)\s+(.+)$/i))) { out.kind = 'time'; out.amt = secToStr(/^s/i.test(mm[2]) ? +mm[1] : (mm[1].includes(':') ? strToSec(mm[1]) : +mm[1] * 60)); out.name = mm[3]; }
+  else if ((mm = main.match(/^(\d+(?:\.\d+)?)\s*(km|k|m|mile|miles|mi|ft)\s+(.+)$/i))) { const u = mm[2].toLowerCase(); if (u === 'km' || u === 'k') { out.kind = 'm'; out.amt = String(+mm[1] * 1000); } else if (u.startsWith('mi')) { out.kind = 'mi'; out.amt = mm[1]; } else { out.kind = u; out.amt = mm[1]; } out.name = mm[3]; }
+  else if ((mm = main.match(/^(\d+(?:[–-]\d+)?)\s+(.+)$/))) { out.name = mm[2]; if (out.kind !== 'cal') { out.amt = mm[1].replace('–', '-'); out.kind = /^(Row|Run|Ski|Ski Erg|Bike)\b/i.test(mm[2]) && +mm[1] >= 100 ? 'm' : 'reps'; } }
+  else out.name = main;
+  out.name = out.name.replace(/\s+/g, ' ').trim();
+  out.note = notes.filter(Boolean).join(' · ');
+  return out;
+}
+const mvAmtStr = m => !m.amt ? '' : m.kind === 'reps' ? m.amt : m.kind === 'time' || m.kind === 'rest' ? m.amt : `${m.amt} ${UNIT_LABEL[m.kind]}`;
+function mvText(m) {
+  if (!m) return ''; if (typeof m === 'string') return m;
+  if (m.kind === 'note') return m.name;
+  if (m.kind === 'rest') return `Rest ${m.amt}${m.note ? ' ' + m.note : ''}`;
+  return [m.slot ? `Min ${m.slot}:` : '', mvAmtStr(m), m.name, m.wt ? `@ ${m.wt} lb` : '', m.note ? `(${m.note})` : ''].filter(Boolean).join(' ');
+}
+function mvFromText(t) { const m = parseMv(t); if (m.wtPct) m.wt = r5(currentBW() * m.wtPct / 100); return m; }
+function migrateMovements() {
+  for (const w of S.workouts) for (const b of w.blocks || []) if (b.type === 'cond' && (b.movements || []).some(m => typeof m === 'string')) b.movements = b.movements.filter(m => typeof m !== 'string' || m.trim()).map(m => typeof m === 'string' ? mvFromText(m) : m);
+}
+function condFromProgram(p, lbl) {
+  let mv = p.movements.map(mvFromText);
+  if (!mv.length) { const m = mvFromText(p.title.replace(/\s*[–-]\s*For Time$/i, '')); if (m.kind !== 'reps' || m.amt) mv = [m]; }
+  const b = { type: 'cond', title: p.title, label: lbl, format: p.format, cap: p.cap || '', movements: mv, restAfter: p.restAfter || '', result: {} };
+  const r = p.title.match(/(\d+)\s+(Rounds|Sets)/i); if (r) b.rounds = +r[1];
+  const ev = p.title.match(/Every (\d+(?::\d+)?) Minutes?/i);
+  if (p.format === 'emom') { b.every = 60; b.count = p.cap || ''; }
+  else if (ev) { b.every = ev[1].includes(':') ? strToSec(ev[1]) : +ev[1] * 60; b.count = r ? +r[1] : (p.cap ? Math.round(p.cap * 60 / b.every) : ''); }
+  b.sig = sigOf(b);
+  return b;
+}
+
+/* ---------- paces from Week 1 rows ---------- */
+function rowTime(dist) {
+  let best = null;
+  for (const w of S.workouts) for (const b of w.blocks || []) {
+    if (b.type !== 'cond' || !(b.result && b.result.time > 0)) continue;
+    const mv = (b.movements || []).filter(m => m && m.kind !== 'note' && m.kind !== 'rest');
+    if (mv.length === 1 && /row/i.test(mv[0].name) && mv[0].kind === 'm' && +mv[0].amt === dist && (!best || w.date >= best.date)) best = { date: w.date, sec: b.result.time };
+  }
+  return best;
+}
+function paceInfo(m) {
+  if (!m || !m.pace) return null;
+  const ref = rowTime(m.pace === '2k' ? 2000 : 1000);
+  if (!ref) return { missing: true, txt: `Log your ${m.pace === '2k' ? '2k' : '1k'} row time (Week 1) and the target pace shows here.` };
+  const per500 = ref.sec / (m.pace === '2k' ? 4 : 2);
+  const meters = m.kind === 'm' ? +m.amt : m.kind === 'mi' ? +m.amt * 1609.34 : null;
+  return { per500, target: meters ? per500 * meters / 500 : null, txt: `${m.pace} pace ${secToStr(per500)}/500m${meters ? ` → <b>${secToStr(per500 * meters / 500)}</b> for ${fmtNum(meters)} m` : ''} <span class="muted">(from ${fmtDate(ref.date, false)})</span>` };
+}
+
+/* ---------- fitness test blocks ---------- */
+function testBlocks() {
+  const out = [];
+  for (const w of S.workouts) (w.blocks || []).forEach(b => { if (b.type === 'test' && b.value !== '' && b.value != null && isFinite(b.value)) out.push({ event: b.event, value: +b.value, date: w.date, wid: w.id, bw: workoutBW(w) }); });
+  return out;
+}
+function testHTML(w, b, i, del) {
+  const ev = EVENTS.find(e => e.k === b.event); if (!ev) return '';
+  const bw = workoutBW(w), h_ = S.settings.heightIn || 71;
+  const v = b.value === '' || b.value == null ? null : +b.value;
+  const sc = v != null && isFinite(v) ? ev.score(v, bw, h_) : null;
+  return `<div class="card"><div class="blockhead"><span class="kind grow">Fitness test</span>${del}</div><b>${esc(ev.label)}</b>
+    <p class="small muted">0% = ${fmtStd(ev, valAt(ev, 0, bw, h_))} · 50% = ${fmtStd(ev, valAt(ev, 50, bw, h_))} · 100% = ${fmtStd(ev, valAt(ev, 100, bw, h_))}</p>
+    <div class="grid2"><div><label class="f">Result (${ev.time ? 'mm:ss' : ev.unit})</label><input data-b="${i}" data-f="testval" ${ev.time ? '' : 'inputmode="decimal"'} value="${v == null ? '' : esc(ev.time ? secToStr(v) : v)}" placeholder="${ev.time ? '7:45' : ''}"></div><div><label class="f">Score</label><div class="stat"><div class="v" data-score="${i}">${sc == null ? '–' : Math.round(sc) + '%'}</div></div></div></div>
+    ${ev.k === 'goblet' ? `<p class="small muted">Goblet weight ⅓ BW ≈ ${r5(bw / 3)} lb</p>` : ev.k === 'axle' ? `<p class="small muted">Axle load 1.5× BW ≈ ${r5(bw * 1.5)} lb</p>` : ev.k === 'sandbag' ? `<p class="small muted">Sandbag = bodyweight ≈ ${r5(bw)} lb</p>` : ''}
+    <input data-b="${i}" data-f="notes" value="${esc(b.notes || '')}" placeholder="Notes" style="margin-top:8px"></div>`;
+}
+
+/* ---------- conditioning block UI ---------- */
+const KIND_OPTS = [['reps', 'reps'], ['cal', 'cal'], ['m', 'meters'], ['ft', 'feet'], ['mi', 'miles'], ['time', 'time'], ['rest', 'rest'], ['note', 'text']];
+function condHTML(w, b, i, del) {
+  const r = b.result || {};
+  let h = `<div class="card cond"><div class="blockhead"><span class="kind grow">${esc(b.label || '')}${FORMATS[b.format] || 'Conditioning'}</span>${del}</div>`;
+  h += `<input data-b="${i}" data-f="title" value="${esc(b.title)}" placeholder="Title" style="font-weight:600">`;
+  h += `<div class="grid3"><div><label class="f">Format</label><select data-b="${i}" data-f="format">${Object.entries(FORMATS).map(([k, l]) => `<option value="${k}" ${b.format === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>`;
+  if (b.format === 'emom' || b.format === 'interval') h += `<div><label class="f">Every</label><input data-b="${i}" data-f="every" value="${esc(b.every ? secToStr(b.every) : '')}" placeholder="1:00"></div><div><label class="f">Rounds</label><input inputmode="numeric" data-b="${i}" data-f="count" value="${esc(b.count || '')}"></div>`;
+  else h += `<div><label class="f">Rounds</label><input inputmode="numeric" data-b="${i}" data-f="rounds" value="${esc(b.rounds || '')}" placeholder="1"></div><div><label class="f">Cap (min)</label><input inputmode="decimal" data-b="${i}" data-f="cap" value="${esc(b.cap || '')}"></div>`;
+  h += `</div><label class="f">Movements</label><div class="mvs">`;
+  (b.movements || []).forEach((m, j) => {
+    if (m.kind === 'note') { h += `<div class="mv note"><input data-b="${i}" data-m="${j}" data-f="name" value="${esc(m.name)}"><button class="x" onclick="delMv('${w.id}',${i},${j})">×</button></div>`; return; }
+    if (m.kind === 'rest') { h += `<div class="mv rest"><span class="muted small">Rest</span><input data-b="${i}" data-m="${j}" data-f="amt" value="${esc(m.amt)}" placeholder="1:00" style="width:90px"><span class="small muted grow">${esc(m.note || '')}</span><button class="x" onclick="delMv('${w.id}',${i},${j})">×</button></div>`; return; }
+    const pi = paceInfo(m);
+    h += `<div class="mv"><div class="row"><button class="mvname grow" onclick="pickMv('${w.id}',${i},${j})">${m.slot ? `<span class="muted">Min ${m.slot} · </span>` : ''}${esc(m.name || 'Choose movement')}</button><button class="x" onclick="delMv('${w.id}',${i},${j})">×</button></div>
+      <div class="mvf"><input data-b="${i}" data-m="${j}" data-f="amt" value="${esc(m.amt)}" ${m.kind === 'time' ? 'placeholder="0:30"' : 'inputmode="decimal"'}><select data-b="${i}" data-m="${j}" data-f="kind">${KIND_OPTS.map(([k, l]) => `<option value="${k}" ${m.kind === k ? 'selected' : ''}>${l}</option>`).join('')}</select><div class="wt"><input data-b="${i}" data-m="${j}" data-f="wt" inputmode="decimal" value="${esc(m.wt)}" placeholder="—"><span>lb</span></div></div>
+      ${m.note ? `<div class="small muted">${esc(m.note)}</div>` : ''}${pi ? `<div class="small pace">${pi.txt}</div>` : ''}</div>`;
+  });
+  h += `</div><div class="row" style="margin-top:6px"><button class="btn-sm grow" onclick="addMv('${w.id}',${i})">＋ Movement</button><button class="btn-sm" onclick="addMv('${w.id}',${i},'rest')">＋ Rest</button></div>`;
+  h += `<button class="btn-primary btn-block tstart" onclick="openTimer('${w.id}',${i})">▶ Start timer · ${esc(timerLabel(b))}</button>`;
+  h += `<label class="f">Result</label><div class="grid2">`;
+  if (b.format === 'amrap') h += `<div><input inputmode="numeric" data-b="${i}" data-f="res.rounds" value="${esc(r.rounds ?? '')}" placeholder="Rounds"></div><div><input inputmode="numeric" data-b="${i}" data-f="res.reps" value="${esc(r.reps ?? '')}" placeholder="+ Reps"></div>`;
+  else h += `<div><input data-b="${i}" data-f="res.time" value="${esc(secToStr(r.time))}" placeholder="Time mm:ss"></div>`;
+  h += `<div style="${b.format === 'amrap' ? 'grid-column:1/-1' : ''}"><input data-b="${i}" data-f="res.score" value="${esc(r.score || '')}" placeholder="${b.format === 'amrap' ? 'Other score (optional)' : 'Score: cals, meters, rounds…'}"></div></div>`;
+  h += `<input data-b="${i}" data-f="res.notes" value="${esc(r.notes || '')}" placeholder="Notes / subs" style="margin-top:8px">`;
+  if (b.restAfter) h += `<p class="small muted" style="margin-top:8px">Then: ${esc(b.restAfter)}</p>`;
+  const prev = b.sig ? condHistory(b.sig, w.id) : [];
+  if (prev.length) h += `<p class="small muted" style="margin-top:8px">Previous: ${prev.slice(0, 3).map(p => `<a href="#workout-${p.wid}">${fmtDate(p.date, false)}: ${esc(p.res)}</a>`).join(' · ')}</p>`;
+  return h + `</div>`;
+}
+window.pickMv = async (wid, i, j) => {
+  const b = getW(wid).blocks[i], m = b.movements[j];
+  const v = await pick('Movement', 'movement', m.name); if (!v) return;
+  m.name = v; if (/^(Run|Row|Ski Erg|Bike|Assault Bike|Swim)$/i.test(v) && m.kind === 'reps' && !m.amt) m.kind = /Assault|Bike/i.test(v) ? 'cal' : 'm';
+  b.sig = sigOf(b); saveNow(); rerender();
+};
+window.addMv = async (wid, i, kind) => {
+  const b = getW(wid).blocks[i]; b.movements = b.movements || [];
+  if (kind === 'rest') b.movements.push({ name: 'Rest', kind: 'rest', amt: '1:00', wt: '', note: '' });
+  else { const v = await pick('Add movement', 'movement'); if (!v) return; b.movements.push({ name: v, kind: /^(Run|Row|Ski Erg|Swim)$/i.test(v) ? 'm' : /Bike/i.test(v) ? 'cal' : 'reps', amt: '', wt: '', note: '' }); }
+  b.sig = sigOf(b); saveNow(); rerender();
+};
+window.delMv = (wid, i, j) => { const b = getW(wid).blocks[i]; b.movements.splice(j, 1); b.sig = sigOf(b); saveNow(); rerender(); };
+window.pickExercise = async (wid, i) => {
+  const b = getW(wid).blocks[i]; const v = await pick('Exercise', 'exercise', b.exercise); if (!v) return;
+  b.exercise = v; invalidate(); saveNow(); rerender();
+};
+window.pickCardio = async (wid, i) => {
+  const b = getW(wid).blocks[i]; const v = await pick('Cardio type', 'cardio', b.mode); if (!v) return;
+  b.mode = v; saveNow(); rerender();
+};
+function cardioHTML(w, b, i, del) {
+  const r = b.result || {};
+  return `<div class="card"><div class="blockhead"><span class="kind grow">Cardio</span>${del}</div><button class="mvname btn-block" onclick="pickCardio('${w.id}',${i})">${esc(b.mode || 'Choose type')}</button>
+    <div class="grid2"><div><label class="f">Distance</label><div class="row" style="gap:6px"><input inputmode="decimal" data-b="${i}" data-f="dist" value="${esc(b.dist ?? b.distance ?? '')}"><select data-b="${i}" data-f="unit" style="width:84px">${['mi', 'm', 'km'].map(u => `<option ${(b.unit || 'mi') === u ? 'selected' : ''}>${u}</option>`).join('')}</select></div></div>
+    <div><label class="f">Time</label><input data-b="${i}" data-f="res.time" value="${esc(secToStr(r.time))}" placeholder="mm:ss"></div><div><label class="f">Calories</label><input inputmode="decimal" data-b="${i}" data-f="cals" value="${esc(b.cals || '')}"></div><div><label class="f">Pace</label><div class="small sec" style="padding-top:12px">${cardioPace(b)}</div></div></div>
+    <button class="btn-sm btn-block" style="margin-top:8px" onclick="openTimer('${w.id}',${i})">▶ Stopwatch</button>
+    <input data-b="${i}" data-f="notes" value="${esc(b.notes || '')}" placeholder="Notes" style="margin-top:8px"></div>`;
+}
+function cardioPace(b) {
+  const t = b.result && b.result.time, d = num(b.dist ?? b.distance); if (!t || !d) return '–';
+  const u = b.unit || 'mi'; const mi = u === 'mi' ? d : u === 'km' ? d / 1.60934 : d / 1609.34;
+  return `${secToStr(t / mi)} /mi` + (/row|ski/i.test(b.mode || '') ? ` · ${secToStr(t / (mi * 1609.34) * 500)} /500m` : '');
+}
+
+/* ---------- add menu ---------- */
+window.addBlock = async wid => {
+  const w = getW(wid);
+  const opts = [{ label: '🏋️ Strength exercise (sets × reps)' }, { label: '⏱️ AMRAP' }, { label: '🏁 For Time' }, { label: '🔁 EMOM' }, { label: '⏲️ Every X minutes' }, { label: '🔂 Rounds / intervals' }, { label: '🏃 Cardio (run, row, bike…)' }, { label: '🎒 Ruck' }, { label: '🎯 Fitness test event…' }, { label: '📝 Note' }];
+  if (S.templates.length) opts.push({ label: '⭐ Saved pieces…' });
+  const k = await sheet('Add to workout', opts); if (k < 0) return;
+  let b; const lbl = opts[k].label;
+  if (k === 0) { const ex = await pick('Exercise', 'exercise'); if (!ex) return; b = { type: 'strength', exercise: ex, sets: [{ w: '', r: '', done: false }] }; }
+  else if (k >= 1 && k <= 5) {
+    const f = ['amrap', 'fortime', 'emom', 'interval', 'rounds'][k - 1];
+    b = { type: 'cond', title: { amrap: '20 Minutes – AMRAP', fortime: 'For Time', emom: '12 Minutes – EMOM', interval: 'Every 3 Minutes for 5 Rounds', rounds: '4 Rounds' }[f], format: f, cap: f === 'amrap' ? 20 : '', movements: [], result: {} };
+    if (f === 'emom') { b.every = 60; b.count = 12; } if (f === 'interval') { b.every = 180; b.count = 5; } if (f === 'rounds') b.rounds = 4;
+    b.sig = sigOf(b);
+  }
+  else if (k === 6) { const m = await pick('Cardio type', 'cardio'); if (!m) return; b = { type: 'cardio', mode: m, dist: '', unit: /row|ski/i.test(m) ? 'm' : 'mi', cals: '', result: {} }; }
+  else if (k === 7) b = { type: 'ruck', weight: '', minutes: '', distance: '', notes: '', result: {} };
+  else if (k === 8) { const e = await sheet('Fitness test event', EVENTS.map(e => ({ label: esc(e.label) }))); if (e < 0) return; b = { type: 'test', event: EVENTS[e].k, value: '', notes: '' }; }
+  else if (k === 9) b = { type: 'note', text: '' };
+  else { const t = await sheet('Saved pieces', S.templates.map(t => ({ label: esc(t.name) }))); if (t < 0) return; b = JSON.parse(JSON.stringify(S.templates[t].block)); b.result = {}; if (b.sets) b.sets.forEach(s => s.done = false); }
+  w.blocks.push(b); invalidate(); saveNow(); rerender();
+  setTimeout(() => { const cards = document.querySelectorAll('#app .card'); const c = cards[cards.length - 1]; if (c) c.scrollIntoView({ block: 'center' }); }, 40);
+};
+
+/* ---------- sound + screen ---------- */
+let AC = null;
+function audio() { try { if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)(); if (AC.state === 'suspended') AC.resume(); } catch (e) { } return AC; }
+function beep(kind = 'short') {
+  const ac = audio(); if (!ac) return;
+  const tones = kind === 'long' ? [[1320, 0, .7]] : kind === 'go' ? [[988, 0, .18], [1320, .2, .5]] : kind === 'double' ? [[880, 0, .12], [880, .18, .12]] : [[880, 0, .16]];
+  for (const [f, at, dur] of tones) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'square'; o.frequency.value = f;
+    const t0 = ac.currentTime + at; g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.35, t0 + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g).connect(ac.destination); o.start(t0); o.stop(t0 + dur + .05);
+  }
+  const f = document.getElementById('flash'); if (f) { f.classList.remove('on'); void f.offsetWidth; f.classList.add('on'); }
+}
+let wakeLock = null, wantWake = false;
+async function keepAwake(on) {
+  wantWake = on;
+  try {
+    if (on && !wakeLock && 'wakeLock' in navigator) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); }
+    if (!on && wakeLock) { await wakeLock.release(); wakeLock = null; }
+  } catch (e) { }
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && wantWake) keepAwake(true); });
+
+/* ---------- strength rest timer ---------- */
+let REST = null;
+function restSecs(b) { if (b.rx && b.rx.rest) { const d = parseDur(b.rx.rest); if (d) return d; } return 120; }
+function startRest(sec, label) {
+  stopRest(true); audio();
+  REST = { end: Date.now() + sec * 1000, total: sec, label, fired: {} };
+  let el = document.getElementById('restbar'); if (!el) { el = document.createElement('div'); el.id = 'restbar'; document.body.appendChild(el); }
+  el.innerHTML = `<div class="rb-bar"><span></span></div><div class="row"><div class="grow"><div class="small muted">Rest · ${esc(label)}</div><div class="rb-t">0:00</div></div><button class="btn-sm" onclick="addRest(30)">+30s</button><button class="btn-sm btn-danger" onclick="stopRest()">Stop</button></div>`;
+  REST.iv = setInterval(tickRest, 200); tickRest();
+}
+function tickRest() {
+  if (!REST) return; const left = Math.ceil((REST.end - Date.now()) / 1000);
+  const el = document.getElementById('restbar'); if (!el) return;
+  el.querySelector('.rb-t').textContent = left > 0 ? secToStr(left) : 'Go!';
+  el.querySelector('.rb-bar span').style.width = Math.max(0, Math.min(100, (1 - left / REST.total) * 100)) + '%';
+  for (const s of [3, 2, 1]) if (left === s && !REST.fired[s]) { REST.fired[s] = 1; beep('short'); }
+  if (left <= 0 && !REST.fired[0]) { REST.fired[0] = 1; beep('long'); setTimeout(() => stopRest(), 2500); }
+}
+window.addRest = s => { if (REST) { REST.end += s * 1000; REST.total += s; [3, 2, 1].forEach(k => delete REST.fired[k]); } };
+window.stopRest = quiet => { if (REST) clearInterval(REST.iv); REST = null; const el = document.getElementById('restbar'); if (el) el.remove(); };
+window.toggleSet = (wid, i, j) => {
+  const b = getW(wid).blocks[i], s = b.sets[j]; s.done = !s.done; invalidate(); saveNow(); rerender();
+  if (s.done && j < b.sets.length - 1) startRest(restSecs(b), b.exercise);
+  else if (s.done) startRest(restSecs(b), b.exercise + ' · last set');
+};
+
+/* ---------- workout timer ---------- */
+function timedMv(m) { return m && (m.kind === 'time' || m.kind === 'rest') && strToSec(m.amt) > 0; }
+function timerPlan(b) {
+  if (b.type === 'cardio') return { mode: 'up' };
+  const mv = (b.movements || []).filter(m => m && m.kind !== 'note');
+  const cap = num(b.cap) ? num(b.cap) * 60 : null;
+  if ((b.format === 'emom' || b.format === 'interval') && b.every && num(b.count)) return { mode: 'intervals', every: +b.every, count: num(b.count), slots: mv.filter(m => m.slot) };
+  if (b.format === 'amrap') return { mode: 'down', total: cap || 600 };
+  if (mv.some(timedMv)) {
+    const R = Math.max(1, num(b.rounds) || 1), segs = [];
+    for (let r = 1; r <= R; r++) mv.forEach((m, j) => {
+      const last = r === R && mv.slice(j + 1).every(x => x.kind === 'rest');
+      if (m.kind === 'rest' && last) return;
+      segs.push({ r, R, m, dur: timedMv(m) ? strToSec(m.amt) : null, rest: m.kind === 'rest' });
+    });
+    return { mode: 'seq', segs };
+  }
+  if (b.format === 'other' && cap) return { mode: 'down', total: cap };
+  return { mode: 'up', cap, rounds: num(b.rounds) || null };
+}
+function timerLabel(b) {
+  const p = timerPlan(b);
+  if (p.mode === 'down') return `${secToStr(p.total)} countdown`;
+  if (p.mode === 'intervals') return `every ${secToStr(p.every)} × ${p.count}`;
+  if (p.mode === 'seq') return `${p.segs.length} interval${p.segs.length === 1 ? '' : 's'}`;
+  return p.cap ? `stopwatch, cap ${secToStr(p.cap)}` : 'stopwatch';
+}
+let T = null;
+const mvShort = m => !m ? '' : m.kind === 'rest' ? 'Rest' : [m.kind === 'reps' ? m.amt : m.kind === 'time' ? m.amt : m.amt ? `${m.amt} ${UNIT_LABEL[m.kind]}` : '', m.name].filter(Boolean).join(' ');
+const workMvs = b => (b.movements || []).filter(m => m && m.kind !== 'note' && m.kind !== 'rest');
+window.openTimer = (wid, i) => {
+  if (T) return toast('A timer is already running');
+  const w = getW(wid), b = w.blocks[i]; audio(); keepAwake(true);
+  T = { wid, i, b, plan: timerPlan(b), phase: 'ready', t0: null, paused: null, pausedTotal: 0, fired: {}, rounds: 0, segIdx: 0, segStart: 0, mvIdx: 0, lastIv: -1 };
+  const el = document.createElement('div'); el.id = 'timer';
+  el.innerHTML = `<div id="flash"></div><div class="tm-top"><span class="tm-title"></span><span class="tm-rl"></span></div>
+    <div class="tm-clock">0:00</div>
+    <div class="tm-cur" onclick="timerTap()"></div>
+    <div class="tm-next"></div>
+    <div class="tm-btns"></div>`;
+  document.body.appendChild(el); drawTimerButtons(); T.iv = setInterval(tickTimer, 100); tickTimer();
+};
+function drawTimerButtons() {
+  const el = document.querySelector('#timer .tm-btns'); if (!el || !T) return;
+  let h = '';
+  if (T.phase === 'ready') h = `<button class="btn-primary tm-go" onclick="timerGo()">Start</button><button onclick="closeTimer()">Close</button>`;
+  else if (T.phase === 'done') h = `<button class="btn-primary" onclick="closeTimer(true)">Save result</button><button onclick="closeTimer()">Close without saving</button>`;
+  else h = `<button onclick="timerPause()">${T.paused ? 'Resume' : 'Pause'}</button><button class="btn-danger" onclick="timerStop()">${T.plan.mode === 'down' ? 'End' : 'Stop'}</button>`;
+  el.innerHTML = h;
+}
+window.timerGo = () => { audio(); T.phase = 'lead'; T.leadEnd = Date.now() + 10000; drawTimerButtons(); };
+const tNow = () => (T.paused || Date.now()) - T.t0 - T.pausedTotal;
+window.timerPause = () => { if (!T || !T.t0) return; if (T.paused) { T.pausedTotal += Date.now() - T.paused; T.paused = null; } else T.paused = Date.now(); drawTimerButtons(); };
+window.timerStop = () => finishTimer();
+// tap the exercise: move to the next movement; finishing the last one counts a round
+window.timerTap = () => {
+  if (!T || T.phase !== 'run' || T.paused) return;
+  const p = T.plan;
+  if (p.mode === 'seq') { const seg = p.segs[T.segIdx]; if (seg && !seg.dur) { T.segIdx++; T.segStart = tNow() / 1000; T.fired = {}; if (T.segIdx >= p.segs.length) finishTimer(); else beep('go'); } return; }
+  const mv = p.mode === 'intervals' && p.slots.length ? [] : workMvs(T.b); if (!mv.length) return;
+  T.mvIdx++;
+  if (T.mvIdx >= mv.length) { T.mvIdx = 0; if (p.mode !== 'intervals') { T.rounds++; beep('double'); if (p.mode === 'up' && p.rounds && T.rounds >= p.rounds) return finishTimer(); } else beep('short'); }
+  else beep('short');
+};
+function fireOnce(key, kind) { if (!T.fired[key]) { T.fired[key] = 1; beep(kind); } }
+function showMv(cur, next, tappable) {
+  const el = document.getElementById('timer'); if (!el) return;
+  const c = el.querySelector('.tm-cur'), n = el.querySelector('.tm-next');
+  if (c.dataset.v !== cur) { c.dataset.v = cur; c.textContent = cur; }
+  c.classList.toggle('tap', !!tappable);
+  const nv = next ? 'Next: ' + next : '';
+  if (n.dataset.v !== nv) { n.dataset.v = nv; n.textContent = nv; }
+}
+function roundsLeftText() {
+  const p = T.plan;
+  if (p.mode === 'seq') { const seg = p.segs[Math.min(T.segIdx, p.segs.length - 1)]; const left = seg.R - seg.r + 1; return seg.R > 1 ? `${left} rd${left === 1 ? '' : 's'} left` : ''; }
+  if (p.mode === 'intervals') { const s = tNow() / 1000, idx = Math.min(p.count - 1, Math.floor(s / p.every)), left = p.count - idx; return `${left} left`; }
+  if (p.mode === 'up' && p.rounds) { const left = Math.max(0, p.rounds - T.rounds); return `${left} rd${left === 1 ? '' : 's'} left`; }
+  return T.rounds ? `${T.rounds} rd${T.rounds === 1 ? '' : 's'}` : '';
+}
+function tickTimer() {
+  if (!T) return; const el = document.getElementById('timer'); if (!el) return;
+  const clock = el.querySelector('.tm-clock'), title = el.querySelector('.tm-title'), rl = el.querySelector('.tm-rl');
+  const p = T.plan, mv = workMvs(T.b);
+  const firstSeg = p.mode === 'seq' ? p.segs[0] : null;
+  const firstCur = firstSeg ? mvShort(firstSeg.m) : p.mode === 'intervals' && p.slots.length ? mvShort(p.slots[0]) : mvShort(mv[0]);
+  const firstNext = firstSeg ? mvShort((p.segs[1] || {}).m) : p.mode === 'intervals' && p.slots.length ? mvShort(p.slots[1 % p.slots.length]) : mv.length > 1 ? mvShort(mv[1]) : '';
+  if (T.phase === 'ready') { title.textContent = T.b.title || T.b.mode || ''; rl.textContent = ''; clock.textContent = p.mode === 'down' ? secToStr(p.total) : p.mode === 'intervals' ? secToStr(p.every) : '0:00'; showMv(firstCur, firstNext); return; }
+  if (T.phase === 'done') return;
+  title.textContent = T.paused ? 'Paused' : '';
+  if (T.phase === 'lead') {
+    const left = Math.ceil((T.leadEnd - Date.now()) / 1000);
+    clock.textContent = left > 0 ? left : 'GO'; rl.textContent = ''; showMv(firstCur, firstNext);
+    for (const s of [3, 2, 1]) if (left === s) fireOnce('lead' + s, 'short');
+    if (left <= 0) { fireOnce('go', 'go'); T.phase = 'run'; T.t0 = Date.now(); T.fired = {}; T.segStart = 0; drawTimerButtons(); }
+    return;
+  }
+  if (T.phase === 'done') return;
+  const s = tNow() / 1000;
+  rl.textContent = roundsLeftText();
+  if (p.mode === 'up' || p.mode === 'down') {
+    if (p.mode === 'up') { clock.textContent = secToStr(Math.floor(s)); if (p.cap) { const left = Math.ceil(p.cap - s); capAlerts(left, p.cap); if (left <= 0) return finishTimer(); } }
+    else { const left = Math.ceil(p.total - s); clock.textContent = secToStr(Math.max(0, left)); capAlerts(left, p.total); if (left <= 0) return finishTimer(); }
+    if (mv.length) showMv(mvShort(mv[T.mvIdx % mv.length]), mv.length > 1 ? mvShort(mv[(T.mvIdx + 1) % mv.length]) : '', true);
+    else showMv('', '');
+  } else if (p.mode === 'intervals') {
+    const idx = Math.floor(s / p.every), inLeft = Math.ceil(p.every - (s - idx * p.every));
+    if (idx >= p.count) return finishTimer();
+    if (idx !== T.lastIv) { if (idx > 0) beep('go'); T.lastIv = idx; T.mvIdx = 0; }
+    clock.textContent = secToStr(inLeft);
+    if (p.slots.length) showMv(mvShort(p.slots[idx % p.slots.length]), idx + 1 < p.count ? mvShort(p.slots[(idx + 1) % p.slots.length]) : '');
+    else if (mv.length) showMv(mvShort(mv[Math.min(T.mvIdx, mv.length - 1)]), T.mvIdx + 1 < mv.length ? mvShort(mv[T.mvIdx + 1]) : (idx + 1 < p.count ? mvShort(mv[0]) : ''), true);
+    for (const k of [3, 2, 1]) if (inLeft === k) fireOnce(`i${idx}-${k}`, 'short');
+  } else if (p.mode === 'seq') {
+    const seg = p.segs[T.segIdx]; if (!seg) return finishTimer();
+    const inSeg = s - T.segStart, nx = p.segs[T.segIdx + 1];
+    el.classList.toggle('resting', !!seg.rest);
+    showMv(mvShort(seg.m), nx ? mvShort(nx.m) : '', !seg.dur);
+    if (seg.dur) {
+      const left = Math.ceil(seg.dur - inSeg); clock.textContent = secToStr(Math.max(0, left));
+      for (const k of [3, 2, 1]) if (left === k) fireOnce(`s${T.segIdx}-${k}`, 'short');
+      if (left <= 0) { T.segIdx++; T.segStart = T.segStart + seg.dur; T.fired = {}; if (T.segIdx >= p.segs.length) finishTimer(); else beep('go'); }
+    } else clock.textContent = secToStr(Math.floor(inSeg));
+  }
+}
+function capAlerts(left, total) {
+  const half = Math.ceil(total / 2);
+  if (total >= 120 && left === half) fireOnce('half', 'double');
+  if (total > 90 && left === 60) fireOnce('60', 'double');
+  if (total > 20 && left === 10) fireOnce('10', 'double');
+  for (const k of [3, 2, 1]) if (left === k) fireOnce('c' + k, 'short');
+}
+function finishTimer() {
+  if (!T || T.phase === 'done') return;
+  const p = T.plan; const el = document.getElementById('timer');
+  T.elapsed = Math.round(Math.min(tNow() / 1000, p.mode === 'down' ? p.total : Infinity));
+  T.phase = 'done'; beep('long');
+  if (el) {
+    el.classList.remove('resting');
+    el.querySelector('.tm-clock').textContent = secToStr(T.elapsed);
+    el.querySelector('.tm-title').textContent = 'Done';
+    el.querySelector('.tm-rl').textContent = T.rounds ? `${T.rounds} rds` : '';
+    showMv('', '');
+  }
+  drawTimerButtons();
+}
+window.closeTimer = async saveIt => {
+  if (!T) return; clearInterval(T.iv);
+  const t = T; T = null; const el = document.getElementById('timer'); if (el) el.remove();
+  if (saveIt) {
+    const w = getW(t.wid), b = w && w.blocks[t.i];
+    if (b) {
+      b.result = b.result || {};
+      if (b.format === 'amrap') {
+        const r = await form('AMRAP result', [{ label: 'Full rounds', value: t.rounds, mode: 'numeric' }, { label: 'Extra reps', value: '', mode: 'numeric' }], 'Save');
+        if (r) { b.result.rounds = r[0]; b.result.reps = r[1]; }
+      } else b.result.time = t.elapsed;
+      if (b.type === 'cond' && t.rounds && b.format !== 'amrap' && !b.result.score) b.result.score = `${t.rounds} rounds`;
+      saveNow(); rerender(); toast('Result saved');
+    }
+  }
+  if (!(location.hash.startsWith('#workout') && activeWorkout())) keepAwake(false);
 };
 
 /* ---------- first launch ---------- */
