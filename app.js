@@ -2,6 +2,7 @@
    and is copied automatically to your Google Sheet backup when sync is set up. */
 'use strict';
 const KEY = 'trainingLog.v1';
+const APP_VERSION = '2026.11.24-8';
 const PREVIEW = !!window.PREVIEW;
 const LS = (() => { try { localStorage.setItem('__t', '1'); localStorage.removeItem('__t'); return localStorage; } catch (e) { const m = {}; return { getItem: k => k in m ? m[k] : null, setItem: (k, v) => { m[k] = String(v); }, removeItem: k => { delete m[k]; } }; } })();
 const CORE = ['Back Squat', 'Deadlift', 'Strict Press', 'Pull-Up'];
@@ -750,6 +751,7 @@ views.more = () => {
   h += `<h2>Program</h2><div class="card"><p>${PROGRAM_NAME}</p><p class="small muted">${Object.keys(S.program.completed).length}/70 days done${S.program.started ? ' · started ' + fmtDate(S.program.started) : ''}</p><button onclick="restartProgram()">Restart at Week 1 Day 1</button></div>`;
   h += `<h2>Injury pause</h2><div class="card"><p class="small sec">Freezes fitness decay while it's on. Off by default.</p><button onclick="togglePause()">${paused ? 'Turn pause OFF' : 'Turn pause on'}</button></div>`;
   if (!PREVIEW) h += `<h2>Extra safety copy</h2><div class="card"><p class="small sec">Save a full copy as a file (to Files / iCloud Drive), or load one back.</p><div class="row wrap"><button onclick="exportJSON()">Export file</button><button onclick="document.getElementById('imp').click()">Import file</button><input type="file" id="imp" accept="application/json,.json" style="display:none" onchange="importJSON(this)"></div></div>`;
+  h += `<h2>App version</h2><div class="card"><div class="row between"><div><b>${APP_VERSION}</b><div class="small muted">Not seeing a new update? Tap this. Your data is not touched.</div></div><button class="btn-sm" onclick="forceUpdate()">Check for updates</button></div></div>`;
   h += `<p class="small muted" style="margin-top:20px">${S.workouts.length} workouts · ${S.workouts.reduce((a, w) => a + w.blocks.reduce((x, b) => x + (b.sets ? b.sets.length : 0), 0), 0)} sets stored on this phone.</p><p class="small muted" id="persist"></p>`;
   return h;
 };
@@ -1246,6 +1248,12 @@ window.closeTimer = async saveIt => {
   if (!(location.hash.startsWith('#workout') && activeWorkout())) keepAwake(false);
 };
 
+window.forceUpdate = async () => {
+  toast('Getting the newest version…');
+  try { if (navigator.serviceWorker) { const regs = await navigator.serviceWorker.getRegistrations(); await Promise.all(regs.map(r => r.unregister())); } } catch (e) { }
+  try { if (window.caches) { const ks = await caches.keys(); await Promise.all(ks.map(k => caches.delete(k))); } } catch (e) { }
+  setTimeout(() => location.reload(), 600);
+};
 /* ---------- first launch ---------- */
 function welcome() {
   $('#tabs').innerHTML = '';
